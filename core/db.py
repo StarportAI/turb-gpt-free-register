@@ -6,6 +6,8 @@ SQLite 持久化层（JSON/TXT 仅用于首次迁移）。
 """
 import hashlib
 import json
+import pyotp
+from urllib.parse import parse_qs, urlparse
 import sqlite3
 import threading
 import uuid
@@ -2408,6 +2410,104 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
         _save_generic_api_emails(generic_rows)
         _save_imap_emails(imap_rows)
         _save_accounts(accounts)
+        return inserted, skipped
+
+
+def normalize_totp_secret(value: object) -> str:
+    """把导入的 2FA 文本收成 pyotp 可用的 Base32 密钥。"""
+    raw = str(value or "").strip().strip("`")
+    if raw.lower().startswith("otpauth://"):
+        parsed = urlparse(raw)
+        raw = (parse_qs(parsed.query).get("secret") or [""])[0].strip()
+    if raw.upper().startswith("2FA:"):
+        raw = raw.split(":", 1)[1].strip()
+    raw = "".join(raw.split()).upper()
+    if not raw or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567=" for ch in raw):
+        raise ValueError("2FA 密钥不是有效的 TOTP secret")
+    pyotp.TOTP(raw).now()
+    return raw
+
+
+def parse_login_credential_text(text: str) -> tuple[list[dict], list[dict]]:
+    """解析 邮箱----密码----2FA密钥。返回 (记录, 错误)。错误不含密码。"""
+    records: list[dict] = []
+    errors: list[dict] = []
+    for lineno, line in enumerate(str(text or "").splitlines(), 1):
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        parts = [part.strip() for part in (raw.split("----") if "----" in raw else raw.split("===="))]
+        if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
+            errors.append({"line": lineno, "error": "需要 3 段：邮箱----密码----2FA密钥"})
+            continue
+        if "@" not in parts[0] or " " in parts[0]:
+            errors.append({"line": lineno, "error": "第一列不是邮箱"})
+            continue
+        try:
+            secret = normalize_totp_secret(parts[2])
+        except Exception as exc:
+            errors.append({"line": lineno, "error": str(exc) or "2FA 密钥无效"})
+            continue
+        records.append({
+            "email": parts[0],
+            "registration_password": parts[1],
+            "totp_secret": secret,
+        })
+    return records, errors
+
+
+def import_login_credential_accounts(records: list[dict]) -> tuple[int, int]:
+    """把已有 ChatGPT 登录凭据导入账号表，供 Codex 密码 + 2FA 补跑。
+
+    已存在的邮箱跳过，不覆盖。密码写入 extra_json.registration_password，
+    2FA 写入 totp_secret。不进入邮箱池。
+    """
+    with _LOCK:
+        accounts = _load_accounts()
+        inserted = skipped = 0
+        for raw in records:
+            email = str(raw.get("email") or "").strip()
+            password = str(raw.get("registration_password") or raw.get("password") or "").strip()
+            try:
+                totp_secret = normalize_totp_secret(raw.get("totp_secret") or raw.get("totp"))
+            except Exception:
+                skipped += 1
+                continue
+            if not email or "@" not in email or not password:
+                skipped += 1
+                continue
+            if _find_by_email(accounts, email):
+                skipped += 1
+                continue
+            now = _now()
+            row_id = _next_id(accounts)
+            account = {
+                "id": row_id,
+                "email": email,
+                "created_at": now,
+                "updated_at": now,
+                "access_token": "",
+                "totp_secret": totp_secret,
+                "registration_password": password,
+                "user_id": None,
+                "user_name": email,
+                "plan_type": None,
+                "email_source": "已导入",
+                "extra_json": json.dumps({
+                    "imported_registered": True,
+                    "import_kind": "login_credentials",
+                    "registration_password": password,
+                }, ensure_ascii=False),
+                "codex_status": "",
+                "codex_error": None,
+                "original_email_line": email,
+                "note": "导入的已注册账号，使用密码和 2FA 补跑 Codex",
+            }
+            account["copy_line"] = _account_line(account)
+            accounts.append(account)
+            inserted += 1
+        if inserted:
+            _save_accounts(accounts)
         return inserted, skipped
 
 

@@ -69,6 +69,20 @@ SUB2_CODEX_AUTH_PREFIX: str = ""
 # exchange_code     => 只换 token，不创建账号（兼容旧逻辑）
 SUB2_CODEX_CALLBACK_PAYLOAD_MODE: str = "create_from_oauth"
 
+
+# 授权成功后写入 sub2 账号的固定属性。
+# 分组：gpt-luna=68，以及 codex plus=2、codex free=3、gpt-plus=8、gpt-pro=33、
+# gpt-pro-稳定=75、gpt-pro-5x=86、gpt-特惠=87。
+# 代理「Egress 美国堪萨斯|AI推荐」=29。gpt-pro-5x 有空的同名分组 85，使用有账号的 86。
+SUB2_IMPORT_APPLY_PROFILE: bool = True
+SUB2_IMPORT_GROUP_ID: int = 68
+SUB2_IMPORT_GROUP_IDS: list[int] = [68, 2, 3, 8, 33, 75, 86, 87]
+SUB2_IMPORT_PROXY_ID: int = 29
+SUB2_IMPORT_CONCURRENCY: int = 5
+SUB2_IMPORT_PRIORITY: int = 1
+SUB2_IMPORT_FINGERPRINT_MODE: str = "full"
+SUB2_IMPORT_MODEL: str = "gpt-5.6-luna"
+
 apply_env_overrides(globals(), {
     'SUB2API_AUTO_EXPORT': 'bool',
     'SUB2API_SYNC_MODE': 'str',
@@ -88,4 +102,11 @@ apply_env_overrides(globals(), {
     'SUB2_CODEX_AUTH_HEADER': 'str',
     'SUB2_CODEX_AUTH_PREFIX': 'str',
     'SUB2_CODEX_CALLBACK_PAYLOAD_MODE': 'str',
+    'SUB2_IMPORT_APPLY_PROFILE': 'bool',
+    'SUB2_IMPORT_GROUP_ID': 'int',
+    'SUB2_IMPORT_PROXY_ID': 'int',
+    'SUB2_IMPORT_CONCURRENCY': 'int',
+    'SUB2_IMPORT_PRIORITY': 'int',
+    'SUB2_IMPORT_FINGERPRINT_MODE': 'str',
+    'SUB2_IMPORT_MODEL': 'str',
 })

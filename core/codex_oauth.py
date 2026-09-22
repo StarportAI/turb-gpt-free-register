@@ -437,11 +437,141 @@ def _summarize_sub2_response(payload: dict) -> str:
     return str(payload)[:300]
 
 
-def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_uri: str = "") -> dict:
+def _sub2_import_settings() -> dict:
+    from config import sub2api as _sub2_cfg
+    return {
+        "apply": bool(getattr(_sub2_cfg, "SUB2_IMPORT_APPLY_PROFILE", True)),
+        "group_id": int(getattr(_sub2_cfg, "SUB2_IMPORT_GROUP_ID", 68) or 68),
+        "group_ids": [int(item) for item in (getattr(_sub2_cfg, "SUB2_IMPORT_GROUP_IDS", None) or [getattr(_sub2_cfg, "SUB2_IMPORT_GROUP_ID", 68)])],
+        "proxy_id": int(getattr(_sub2_cfg, "SUB2_IMPORT_PROXY_ID", 29) or 29),
+        "concurrency": int(getattr(_sub2_cfg, "SUB2_IMPORT_CONCURRENCY", 5) or 5),
+        "priority": int(getattr(_sub2_cfg, "SUB2_IMPORT_PRIORITY", 1) or 1),
+        "fingerprint_mode": str(getattr(_sub2_cfg, "SUB2_IMPORT_FINGERPRINT_MODE", "full") or "full").strip() or "full",
+        "model": str(getattr(_sub2_cfg, "SUB2_IMPORT_MODEL", "gpt-5.6-luna") or "gpt-5.6-luna").strip() or "gpt-5.6-luna",
+    }
+
+
+def _extract_sub2_account_id(payload: dict | None) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    nodes = [payload]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        nodes.append(data)
+        account = data.get("account")
+        if isinstance(account, dict):
+            nodes.append(account)
+    account = payload.get("account")
+    if isinstance(account, dict):
+        nodes.append(account)
+    for node in nodes:
+        for key in ("id", "account_id"):
+            value = node.get(key)
+            if str(value or "").isdigit():
+                return int(value)
+    return 0
+
+
+def _iter_sub2_account_items(payload: dict) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    candidates = []
+    if isinstance(data, list):
+        candidates.append(data)
+    if isinstance(data, dict):
+        for key in ("items", "list", "accounts", "records"):
+            if isinstance(data.get(key), list):
+                candidates.append(data[key])
+    for key in ("items", "list", "accounts"):
+        if isinstance(payload.get(key), list):
+            candidates.append(payload[key])
+    items = []
+    for group in candidates:
+        items.extend(row for row in group if isinstance(row, dict))
+    return items
+
+
+def _find_sub2_account_id_by_email(email: str) -> int:
+    target = str(email or "").strip().lower()
+    if not target:
+        return 0
+    queries = (
+        f"/api/v1/admin/accounts?search={quote(target)}&page=1&page_size=20",
+        f"/api/v1/admin/accounts?keyword={quote(target)}&page=1&page_size=20",
+        f"/api/v1/admin/accounts?email={quote(target)}&page=1&page_size=20",
+    )
+    for path in queries:
+        try:
+            payload = _sub2_codex_request_json("GET", path)
+        except Exception as exc:
+            logger.info("[Codex][sub2] 按邮箱查找账号未成功：%s", str(exc)[:160])
+            continue
+        for item in _iter_sub2_account_items(payload):
+            name = str(item.get("name") or "").strip().lower()
+            extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+            creds = item.get("credentials") if isinstance(item.get("credentials"), dict) else {}
+            emails = {
+                name,
+                str(extra.get("email") or "").strip().lower(),
+                str(creds.get("email") or "").strip().lower(),
+            }
+            if target in emails and str(item.get("id") or "").isdigit():
+                return int(item["id"])
+    return 0
+
+
+def apply_sub2_import_profile(email: str, created: dict | None = None) -> dict:
+    """把刚授权进 sub2 的账号改成 gpt-luna 导入属性。"""
+    settings = _sub2_import_settings()
+    if not settings["apply"]:
+        return {"ok": True, "skipped": True}
+    account_email = str(email or "").strip()
+    if not account_email:
+        raise RuntimeError("[Codex][sub2] 缺少邮箱，无法写入导入属性")
+    account_id = _extract_sub2_account_id(created)
+    if not account_id:
+        account_id = _find_sub2_account_id_by_email(account_email)
+    if not account_id:
+        raise RuntimeError("[Codex][sub2] 已创建账号，但没有找到账号 ID，无法写入 gpt-luna 属性")
+    current = _sub2_codex_request_json("GET", f"/api/v1/admin/accounts/{account_id}")
+    node = current.get("data") if isinstance(current.get("data"), dict) else current
+    if not isinstance(node, dict):
+        raise RuntimeError("[Codex][sub2] 读取账号详情失败")
+    credentials = dict(node.get("credentials") or {})
+    credentials["model_mapping"] = {settings["model"]: settings["model"]}
+    extra = dict(node.get("extra") or {})
+    extra["codex_fingerprint_mode"] = settings["fingerprint_mode"]
+    extra["email"] = account_email
+    body = {
+        "name": account_email,
+        "platform": node.get("platform") or "openai",
+        "type": node.get("type") or "oauth",
+        "credentials": credentials,
+        "extra": extra,
+        "proxy_id": settings["proxy_id"],
+        "concurrency": settings["concurrency"],
+        "priority": settings["priority"],
+        "group_ids": settings["group_ids"],
+        "auto_pause_on_expired": bool(node.get("auto_pause_on_expired", True)),
+        "rate_multiplier": node.get("rate_multiplier", 1),
+        "notes": node.get("notes") or "",
+    }
+    updated = _sub2_codex_request_json("PUT", f"/api/v1/admin/accounts/{account_id}", body)
+    logger.info(
+        "[Codex][sub2] 已写入导入属性：id=%s group=%s proxy=%s concurrency=%s priority=%s fingerprint=%s model=%s",
+        account_id, settings["group_id"], settings["proxy_id"], settings["concurrency"],
+        settings["priority"], settings["fingerprint_mode"], settings["model"],
+    )
+    return {"ok": True, "account_id": account_id, "response": _summarize_sub2_response(updated)}
+
+
+def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_uri: str = "", email: str = "") -> dict:
     """提交 OAuth callback 给 sub2。"""
     from config import sub2api as _sub2_cfg
     path = str(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_PATH", "/api/v1/admin/openai/create-from-oauth") or "/api/v1/admin/openai/create-from-oauth")
     mode = str(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_PAYLOAD_MODE", "create_from_oauth") or "create_from_oauth").strip().lower()
+    settings = _sub2_import_settings()
     if mode == "callback_url":
         body = {"callback_url": str(callback_url or "").strip()}
     elif mode == "redirect_url":
@@ -461,8 +591,10 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
         if redirect_uri:
             body["redirect_uri"] = redirect_uri
         if mode in {"create_from_oauth", "create-from-oauth", "create_oauth_account"}:
-            body.setdefault("concurrency", 3)
-            body.setdefault("priority", 50)
+            if email:
+                body["name"] = email
+            body["concurrency"] = settings["concurrency"]
+            body["priority"] = settings["priority"]
 
     max_attempts = max(1, int(getattr(_cfg, "CPA_CALLBACK_SUBMIT_RETRIES", 5) or 5))
     base_delay = max(1.0, float(getattr(_cfg, "CPA_CALLBACK_SUBMIT_RETRY_DELAY", 6) or 6))
@@ -472,6 +604,16 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
             logger.info("[Codex][sub2] 正在上传 OAuth callback（第 %s/%s 次）... callback=%s", attempt, max_attempts, callback_url)
             payload = _sub2_codex_request_json("POST", path, body)
             logger.info("[Codex][sub2] callback 已上传并处理完成（第 %s 次成功）响应=%s", attempt, _summarize_sub2_response(payload))
+            if email and mode in {"create_from_oauth", "create-from-oauth", "create_oauth_account"}:
+                try:
+                    profile = apply_sub2_import_profile(email, payload)
+                    payload = dict(payload)
+                    payload["import_profile"] = profile
+                except Exception as exc:
+                    logger.warning("[Codex][sub2] 授权已创建，但写入 gpt-luna 属性失败：%s", str(exc)[:300])
+                    payload = dict(payload)
+                    payload["import_profile_error"] = str(exc)[:300]
+                    payload["message"] = f"sub2 账号已创建，但属性写入失败：{str(exc)[:180]}"
             return payload
         except Exception as exc:
             last_exc = exc
@@ -483,7 +625,6 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
             logger.warning("[Codex][sub2] callback 上传失败，将在 %.1fs 后重试：attempt=%s/%s error=%s", delay, attempt, max_attempts, exc)
             time.sleep(delay)
     raise RuntimeError(f"[Codex][sub2] callback 上传失败：{last_exc}")
-
 
 
 def _cpa_request_raw(method: str, path: str, body: dict | None = None, *, response_type: str = "text"):
@@ -1900,6 +2041,7 @@ def run_codex_oauth(
                 callback_url,
                 session_id=(sub2_auth or {}).get("session_id", ""),
                 redirect_uri=(parse_qs(urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
+                email=email,
             )
             path = _save_sub2_local_record(
                 email=email,

@@ -1715,6 +1715,24 @@ def create_app(auth_code: str | None = None) -> Flask:
             "as_registered": as_registered,
         })
 
+    @app.post("/api/accounts/import-login")
+    def api_accounts_import_login():
+        """导入已注册账号：每行 邮箱----密码----2FA密钥。"""
+        data = request.get_json(silent=True) or {}
+        text_value = data.get("text") or ""
+        records, errors = db.parse_login_credential_text(text_value)
+        if not records and not errors:
+            return jsonify({"ok": False, "error": "未解析到有效账号行（需 邮箱----密码----2FA密钥）"}), 400
+        inserted, skipped = db.import_login_credential_accounts(records) if records else (0, 0)
+        return jsonify({
+            "ok": True,
+            "inserted": inserted,
+            "skipped": skipped,
+            "parsed": len(records),
+            "errors": errors[:20],
+            "error_count": len(errors),
+        })
+
     @app.post("/api/outlook/status")
     def api_outlook_status():
         """手动改邮箱状态：body {email, status, note?, source?}。status ∈ available/used/failed/disabled。"""

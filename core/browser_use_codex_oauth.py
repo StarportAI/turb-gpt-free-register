@@ -1556,6 +1556,7 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
                     callback_url,
                     session_id=(sub2_auth or {}).get("session_id", ""),
                     redirect_uri=(proto.parse_qs(proto.urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
+                    email=email,
                 )
                 file_path = proto._save_sub2_local_record(
                     email=email,

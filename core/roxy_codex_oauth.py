@@ -276,7 +276,11 @@ def _is_mfa_challenge_page(driver) -> bool:
 
 
 def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> bool:
-    """如果当前进入 MFA challenge 页面，自动填入账号 TOTP 并提交。"""
+    """如果当前进入 MFA challenge 页面，在页面内填入 TOTP 并提交。
+
+    Cloak 适配层不能把 execute_script 返回的 DOM 元素再传回下一次脚本，
+    所以不能把 input/button 交回 Python 后 scrollIntoView。
+    """
     code = _account_totp_code_for_email(email)
     if not code:
         return False
@@ -287,6 +291,7 @@ def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> boo
                 time.sleep(0.4)
                 continue
             result = driver.execute_script(r"""
+            const code = String(arguments[0] || '');
             const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
               && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
               && !el.disabled && !el.readOnly;
@@ -296,14 +301,18 @@ def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> boo
             if (!input) return {ok:false, reason:'missing_code_input'};
             const button = [...form.querySelectorAll('button[type="submit"], button[data-dd-action-name="Continue"], button')].find(visible);
             if (!button) return {ok:false, reason:'missing_submit'};
-            return {ok:true, input, button};
-            """) or {}
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            input.focus();
+            if (input._valueTracker) input._valueTracker.setValue('');
+            if (setter) setter.call(input, code); else input.value = code;
+            input.dispatchEvent(new Event('input', {bubbles:true}));
+            input.dispatchEvent(new Event('change', {bubbles:true}));
+            button.click();
+            return {ok:true, reason:'mfa_submitted', valueLength: String(input.value || '').length};
+            """, code) or {}
             if not result.get("ok"):
                 time.sleep(0.4)
                 continue
-            _human_type_text(driver, result.get("input"), code, clear=True)
-            human_delay("otp_input")
-            _human_click(driver, result.get("button"), label="codex_mfa_submit")
             logger.info("[Codex][Browser] 已填写并提交 MFA 验证码：%s", email)
             wait_end = time.time() + 12
             while time.time() < wait_end:
@@ -318,7 +327,7 @@ def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> boo
 
 
 def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> str | None:
-    """Codex OAuth 若账号有密码，优先在登录密码页输入密码。返回 next_step / email_otp / None。"""
+    """Codex OAuth 若账号有密码，在登录密码页内填写并提交。返回 next_step / email_otp / None。"""
     password = _account_password_for_email(email)
     if not password:
         return None
@@ -330,6 +339,7 @@ def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> st
             time.sleep(0.4)
             continue
         result = driver.execute_script(r"""
+        const password = String(arguments[0] || '');
         const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
           && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
           && !el.disabled && !el.readOnly;
@@ -348,16 +358,21 @@ def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> st
           .filter(x => x.below)
           .sort((a,b) => a.dist - b.dist || a.idx - b.idx);
         if (!buttons.length) return {ok:false, reason:'missing_submit'};
-        buttons[0].el.scrollIntoView({block:'center'});
-        return {ok:true, reason:'password_targets', input, button: buttons[0].el};
-        """) or {}
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        input.focus();
+        if (input._valueTracker) input._valueTracker.setValue('');
+        if (setter) setter.call(input, password); else input.value = password;
+        input.dispatchEvent(new Event('input', {bubbles:true}));
+        input.dispatchEvent(new Event('change', {bubbles:true}));
+        const button = buttons[0].el;
+        if (button && typeof button.scrollIntoView === 'function') button.scrollIntoView({block:'center'});
+        if (button) button.click();
+        return {ok:true, reason:'password_submitted', valueLength: String(input.value || '').length};
+        """, password) or {}
         if not result.get("ok"):
             logger.info("[Codex][Browser] 登录密码页未找到输入/提交按钮：%s", result)
             time.sleep(0.5)
             continue
-        _human_type_text(driver, result.get("input"), password, clear=True)
-        human_delay("form", minimum=2.0, maximum=3.6)
-        _human_click(driver, result.get("button"), label="codex_password_submit")
         logger.info("[Codex][Browser] 已填写并提交登录密码：%s", email)
         wait_end = time.time() + 12
         while time.time() < wait_end:
@@ -384,25 +399,41 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
 
     # 可能已经处于账号选择/授权页；如果有邮箱输入框则完整登录。
     # 非日本出口时按钮文案/顺序会变，不能按可见文字点“继续”，否则可能误点 Google。
-    try:
-        _type_email_address(driver, email, timeout=12)
-        logger.info("[Codex][Browser] 已填写邮箱：%s", email)
-        human_delay("form")
-        _submit_email_step(driver)
-        logger.info("[Codex][Browser] 已提交邮箱，等待邮箱 OTP 页面")
-        pw_result = _fill_login_password_if_present(driver, email, timeout=18)
-        if pw_result == "next_step":
-            if _is_mfa_challenge_page(driver):
-                _fill_mfa_challenge_if_present(driver, email, timeout=15)
-            logger.info("[Codex][Browser] 账号已用密码完成登录，直接进入后续步骤")
-            return
-        if pw_result == "email_otp":
-            logger.info("[Codex][Browser] 密码登录后仍进入邮箱 OTP 页面")
-        else:
-            _maybe_click_passwordless_after_email(driver, email, timeout=18)
-    except Exception as exc:
-        logger.info("[Codex][Browser] 未检测到邮箱输入框，可能已登录或进入下一步：%s", str(exc)[:120])
-        return
+    email_login_done = False
+    last_email_exc = None
+    for email_attempt in range(1, 4):
+        try:
+            _type_email_address(driver, email, timeout=20)
+            logger.info("[Codex][Browser] 已填写邮箱：%s", email)
+            human_delay("form")
+            _submit_email_step(driver, email)
+            logger.info("[Codex][Browser] 已提交邮箱，等待密码或邮箱 OTP 页面")
+            pw_result = _fill_login_password_if_present(driver, email, timeout=18)
+            if pw_result == "next_step":
+                if _is_mfa_challenge_page(driver):
+                    _fill_mfa_challenge_if_present(driver, email, timeout=15)
+                logger.info("[Codex][Browser] 账号已用密码完成登录，直接进入后续步骤")
+                return
+            if pw_result == "email_otp":
+                logger.info("[Codex][Browser] 密码登录后仍进入邮箱 OTP 页面")
+            else:
+                _maybe_click_passwordless_after_email(driver, email, timeout=18)
+            email_login_done = True
+            break
+        except Exception as exc:
+            last_email_exc = exc
+            logger.warning(
+                "[Codex][Browser] 第 %s/3 次填写邮箱失败，将重新打开授权页：%s",
+                email_attempt, str(exc)[:180],
+            )
+            if email_attempt >= 3:
+                raise
+            human_delay("navigate")
+            driver.get(auth_url)
+            human_delay("navigate")
+            _maybe_accept(driver)
+    if not email_login_done:
+        raise RuntimeError(f"邮箱登录未完成：{last_email_exc}")
 
     # 提交邮箱后不再执行任何全局“继续/授权/分支”兜底点击；后续只等待验证码页。
     # 避免页面已进入 OAuth consent 时误点授权按钮。
@@ -421,7 +452,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         try:
             _type_email_address(driver, email, timeout=12)
             human_delay("form")
-            _submit_email_step(driver)
+            _submit_email_step(driver, email)
             logger.info("[Codex][Browser] 已重新提交邮箱触发 OTP")
             pw_result = _fill_login_password_if_present(driver, email, timeout=12)
             if pw_result == "next_step":
@@ -1215,7 +1246,7 @@ def _do_phone_verification_if_present(driver) -> None:
     try:
         # 如果页面没有手机号输入框，直接返回。
         try:
-            end_detect = time.time() + 8
+            end_detect = time.time() + 3
             while time.time() < end_detect and not _has_strict_add_phone_form(driver):
                 # 如果已经在验证码页，说明手机步骤之前已提交过；继续处理验证码页，不应当跳过。
                 if _is_phone_code_page(driver):
@@ -1319,27 +1350,37 @@ def _do_phone_verification_if_present(driver) -> None:
             pass
 
 
+def _is_post_login_consent(driver) -> bool:
+    try:
+        url = str(driver.current_url or "").lower()
+    except Exception:
+        return False
+    return any(part in url for part in ("sign-in-with-chatgpt", "/consent", "workspace"))
+
+
 def _finish_consent_workspace(driver) -> str:
-    """点击 Codex consent/workspace 页面里的继续/允许按钮，直到 callback。"""
+    """点击 Codex consent/workspace 页面里的继续/允许按钮，直到 callback。
+
+    工作区页的 Continue 放在最前，单轮查找不超过 1 秒，避免先空等 Allow/Authorize。
+    """
     end = time.time() + int(_roxy_cfg.ROXY_CODEX_CALLBACK_TIMEOUT)
     while time.time() < end:
         callback = _extract_callback_url_from_any_window(driver)
         if callback:
             return callback
-        current = str(driver.current_url or "")
         clicked = False
         for selectors in [
-            ["//button[contains(., 'Allow')]", "//button[contains(., 'Authorize')]", "//button[contains(., 'Continue')]"],
+            ["//button[contains(., 'Continue')]", "//button[contains(., '继续')]", "button[type='submit']"],
+            ["//button[contains(., 'Allow')]", "//button[contains(., 'Authorize')]"],
             ["//button[contains(., 'Select')]", "//button[contains(., 'Use workspace')]", "//button[contains(., 'Confirm')]"],
-            ["//button[contains(., '允许')]", "//button[contains(., '授权')]", "//button[contains(., '继续')]", "//button[contains(., '确认')]"],
-            ["button[type='submit']"],
+            ["//button[contains(., '允许')]", "//button[contains(., '授权')]", "//button[contains(., '确认')]"],
         ]:
-            if _click_if_present(driver, selectors, timeout=2):
+            if _click_if_present(driver, selectors, timeout=1):
                 clicked = True
-                human_delay("form")
+                human_delay("click")
                 break
         if not clicked:
-            time.sleep(0.8)
+            time.sleep(0.4)
     return _wait_for_callback(driver, timeout=5)
 
 
@@ -1444,9 +1485,12 @@ def _run_roxy_codex_oauth_once(
 
         _fill_email_and_otp(driver, email, otp_provider, auth_url)
         human_delay("api")
-        logger.info("[Codex][Browser] 检查是否需要手机号验证")
-        _do_phone_verification_if_present(driver)
-        logger.info("[Codex][Browser] 手机验证处理完成/无需处理，等待授权确认和 callback")
+        if _is_post_login_consent(driver):
+            logger.info("[Codex][Browser] 已在工作区或授权确认页，跳过最多 3 秒的手机号探测")
+        else:
+            logger.info("[Codex][Browser] 检查是否需要手机号验证")
+            _do_phone_verification_if_present(driver)
+        logger.info("[Codex][Browser] 等待授权确认和 callback")
         callback_url = _finish_consent_workspace(driver)
         code = proto._extract_code(callback_url, state)
         logger.info("[Codex][Browser] 已捕获 callback code：%s...", code[:24])
@@ -1475,6 +1519,7 @@ def _run_roxy_codex_oauth_once(
                 callback_url,
                 session_id=(sub2_auth or {}).get("session_id", ""),
                 redirect_uri=(proto.parse_qs(proto.urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
+                email=email,
             )
             path = proto._save_sub2_local_record(
                 email=email,

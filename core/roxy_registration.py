@@ -468,7 +468,12 @@ def _find_visible_email_input_js(driver):
       'input[name="email"]',
       'input[name="username"]',
       'input#email-input',
-      'input[autocomplete="email"]'
+      'input#email',
+      'input[autocomplete="email"]',
+      'input[autocomplete="username"]',
+      'input[inputmode="email"]',
+      'input[name*="email" i]',
+      'input[id*="email" i]'
     ];
     for (const sel of selectors) {
       const el = [...document.querySelectorAll(sel)].find(visible);
@@ -482,10 +487,18 @@ def _is_oauth_consent_like(driver) -> bool:
     """检测是否已到 OAuth 授权/consent 页。这里不能再点任何邮箱分支或全局提交按钮。"""
     try:
         return bool(driver.execute_script(r"""
+        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+          && !el.disabled && !el.readOnly;
+        const emailSelector = 'input[type="email"],input[name="email"],input[name="username"],input[autocomplete="email"],input[autocomplete="username"],input[inputmode="email"],input[id*="email" i],input[name*="email" i]';
+        const hasEmail = [...document.querySelectorAll(emailSelector)].some(visible);
+        if (hasEmail) return false;
         const url = String(location.href || '').toLowerCase();
-        if (/oauth|authorize|consent/.test(url) && !/login|signup|identifier|email-verification/.test(url)) return true;
+        // /oauth/authorize 和 /log-in 都还是登录入口。log-in 含连字符，不能只匹配 login。
+        if (/\/oauth\/authorize\b/.test(url) || /\/(log-in|login|sign-in|signup|identifier|email-verification)(\b|\/|\?|#|$)/.test(url)) return false;
+        if (/consent|\/oauth\/grant|\/approve/.test(url)) return true;
         const formsWithEmail = [...document.querySelectorAll('form')]
-          .some(form => form.querySelector('input[type="email"],input[name="email"],input[name="username"],input[autocomplete="email"]'));
+          .some(form => form.querySelector(emailSelector));
         if (formsWithEmail) return false;
         const actions = [...document.querySelectorAll('button,a,[role="button"],input[type="submit"],input[type="button"]')]
           .map(el => [el.id, el.name, el.type, el.getAttribute('data-testid'), el.getAttribute('data-test-id'),
@@ -695,6 +708,7 @@ def _stabilize_email_input_before_submit(driver, email: str) -> dict:
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
         input.scrollIntoView({block:'center', inline:'nearest'});
         input.focus();
+        if (input._valueTracker) input._valueTracker.setValue('');
         if (setter) setter.call(input, email); else input.value = email;
 
         // 让 React/表单校验尽量收到完整输入链路。
@@ -766,6 +780,7 @@ def _submit_email_form_stable(driver, email: str) -> dict:
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
         input.scrollIntoView({block:'center', inline:'nearest'});
         input.focus();
+        if (input._valueTracker) input._valueTracker.setValue('');
         if (setter) setter.call(input, email); else input.value = email;
         try { input.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, cancelable:true, inputType:'insertText', data:email})); } catch (_) {}
         try { input.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:email})); } catch (_) {
@@ -845,6 +860,7 @@ def _recover_email_submit_if_stuck(driver, email: str) -> dict:
         if (!input) return {ok:false, reason:'missing_email_input'};
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
         input.focus();
+        if (input._valueTracker) input._valueTracker.setValue('');
         if (setter) setter.call(input, email); else input.value = email;
         input.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:email}));
         input.dispatchEvent(new Event('change', {bubbles:true}));

@@ -2262,6 +2262,10 @@
       </div>
       <div class="jobs-toolbar-v2" id="accountsToolbarV2">
         <div class="acc-v2-btn-group">
+          <span class="acc-v2-btn-group-title">导入</span>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnImportLoginAccountsV2" title="导入已注册账号：邮箱----密码----2FA密钥">导入账号</button>
+        </div>
+        <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">套餐/提链</span>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
@@ -2576,6 +2580,29 @@
     <div class="outlook-import-foot">
       <button type="button" class="jobs-tb-btn" id="btnCancelOutlookImport">取消</button>
       <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnSubmitOutlookImport">导入</button>
+    </div>
+  </div>
+</div>
+
+<div id="loginImportModal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="loginImportTitle">
+  <div class="outlook-import-dialog" role="document">
+    <div class="outlook-import-head">
+      <div class="outlook-import-head-main">
+        <h3 id="loginImportTitle">导入已注册账号</h3>
+        <p>每行一个：邮箱----ChatGPT密码----2FA密钥。导入后出现在账号页，可直接补跑 Codex。重复邮箱会跳过。</p>
+      </div>
+      <button type="button" class="outlook-import-close" id="btnCloseLoginImport" aria-label="关闭">×</button>
+    </div>
+    <div class="outlook-import-body">
+      <div class="outlook-import-result" id="loginImportResultV2"></div>
+      <label class="outlook-import-field">
+        <span>账号</span>
+        <textarea id="loginImportTextV2" placeholder="email----password----TOTP_SECRET"></textarea>
+      </label>
+    </div>
+    <div class="outlook-import-foot">
+      <button type="button" class="jobs-tb-btn" id="btnCancelLoginImport">取消</button>
+      <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnSubmitLoginImport">导入</button>
     </div>
   </div>
 </div>
@@ -5402,6 +5429,7 @@ async function onOutlookBodyClick(e) {
   window.addEventListener('scroll', () => closeOutlookV2MoreMenus(), true);
   window.addEventListener('resize', () => closeOutlookV2MoreMenus());
   bindOutlookImportModal();
+  bindLoginCredentialImportModal();
 })();
 
 const IMPORT_SOURCE_LABELS = {
@@ -5433,6 +5461,73 @@ function setImportSourceV2(val) {
     : next === 'generic_api'
       ? 'email----取码地址'
       : 'email----password----clientId----refreshToken';
+}
+
+function openLoginImportModal() {
+  const modal = $('#loginImportModal');
+  if (!modal) return;
+  const result = $('#loginImportResultV2');
+  if (result) result.innerHTML = '';
+  modal.classList.remove('hidden');
+  updateModalScrollLock();
+  const ta = $('#loginImportTextV2');
+  if (ta) setTimeout(() => ta.focus(), 50);
+}
+function closeLoginImportModal() {
+  const modal = $('#loginImportModal');
+  if (!modal) return;
+  modal.classList.add('hidden');
+  updateModalScrollLock();
+}
+function bindLoginCredentialImportModal() {
+  const modal = $('#loginImportModal');
+  const openBtn = $('#btnImportLoginAccountsV2');
+  if (!modal || modal.dataset.bound) {
+    if (openBtn && !openBtn.dataset.bound) {
+      openBtn.dataset.bound = '1';
+      openBtn.addEventListener('click', openLoginImportModal);
+    }
+    return;
+  }
+  modal.dataset.bound = '1';
+  if (openBtn) openBtn.addEventListener('click', openLoginImportModal);
+  const closeBtn = $('#btnCloseLoginImport');
+  const cancelBtn = $('#btnCancelLoginImport');
+  const submitBtn = $('#btnSubmitLoginImport');
+  if (closeBtn) closeBtn.addEventListener('click', closeLoginImportModal);
+  if (cancelBtn) cancelBtn.addEventListener('click', closeLoginImportModal);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeLoginImportModal();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal && !modal.classList.contains('hidden')) closeLoginImportModal();
+  });
+  if (submitBtn) submitBtn.addEventListener('click', () => doImportLoginAccounts());
+}
+async function doImportLoginAccounts() {
+  const textEl = $('#loginImportTextV2');
+  const resultEl = $('#loginImportResultV2');
+  const submitBtn = $('#btnSubmitLoginImport');
+  const text = textEl ? textEl.value : '';
+  if (!text.trim()) { showToast('请粘贴账号'); return; }
+  if (submitBtn) submitBtn.disabled = true;
+  try {
+    const r = await api('/api/accounts/import-login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text}) });
+    const errText = (r.errors || []).map(item => `第 ${item.line} 行：${item.error}`).join('；');
+    const msg = `解析 ${r.parsed} 行，新增 ${r.inserted}，跳过 ${r.skipped}${r.error_count ? `，无效 ${r.error_count}` : ''}${errText ? '。' + errText : ''}`;
+    if (resultEl) resultEl.innerHTML = `<div class="banner ${r.error_count ? 'warn' : 'info'}">${esc(msg)}</div>`;
+    if (r.inserted) {
+      if (textEl) textEl.value = '';
+      loadAccounts(); loadSummary();
+    }
+    showToast(`导入完成：新增 ${r.inserted}，跳过 ${r.skipped}`);
+    if (r.inserted && !r.error_count) setTimeout(closeLoginImportModal, 600);
+  } catch (e) {
+    if (resultEl) resultEl.innerHTML = `<div class="banner warn">${esc(e.message)}</div>`;
+    else showToast('导入失败: ' + e.message);
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
 }
 function openOutlookImportModal() {
   const modal = $('#outlookImportModal');
